@@ -1,0 +1,8 @@
+/target
+.env
+debug/
+logs/
+tmp/
+docs/
+*.log
+docs/credentials.txt
