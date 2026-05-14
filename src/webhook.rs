@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     paperless::{PaperlessClient, PaperlessUpdateResult},
-    signature::{SignatureInfo, parse_pdfsig_output},
+    signature::{SignatureInfo, actionable_signatures, parse_pdfsig_output},
 };
 
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ pub struct HealthResponse {
     pub status: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WebhookResponse {
     pub request_id: String,
     pub status: &'static str,
@@ -68,6 +68,14 @@ struct ParsedPayload {
     pdf: Option<ExtractedPdf>,
     fields: BTreeMap<String, String>,
     json: Option<Value>,
+    parameters: RequestParametersDebug,
+}
+
+#[derive(Debug)]
+struct ParsedMultipartPayload {
+    pdf: Option<ExtractedPdf>,
+    fields: Vec<ParameterValue>,
+    parts: Vec<MultipartPartDebug>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,24 +89,102 @@ struct DocumentContext {
 struct DebugDump {
     request_id: String,
     received_at: DateTime<Utc>,
-    remote_addr: String,
-    method: String,
-    uri: String,
-    headers: BTreeMap<String, String>,
+    #[serde(rename = "ASK")]
+    ask: AskDebug,
+    #[serde(rename = "RESPONSE")]
+    response: ResponseDebug,
     context: DocumentContext,
-    body: DebugBody,
     pdf: PdfDebug,
     pdfsig: Option<PdfsigDebug>,
     paperless: PaperlessDebug,
 }
 
 #[derive(Debug, Serialize)]
+struct AskDebug {
+    remote_addr: String,
+    method: String,
+    uri: String,
+    path: String,
+    query_string: Option<String>,
+    content_type: Option<String>,
+    headers: BTreeMap<String, String>,
+    body: DebugBody,
+    parameters: RequestParametersDebug,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseDebug {
+    status_code: u16,
+    body: WebhookResponse,
+}
+
+#[derive(Debug, Serialize)]
 struct DebugBody {
     length: usize,
     sha256: String,
+    is_utf8: bool,
     text: Option<String>,
     json: Option<Value>,
     base64: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct RequestParametersDebug {
+    query: ParameterGroup,
+    json: JsonParametersDebug,
+    form_urlencoded: ParameterGroup,
+    multipart: MultipartParametersDebug,
+    header_context: ParameterGroup,
+    combined: BTreeMap<String, Vec<ParameterOccurrence>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ParameterGroup {
+    count: usize,
+    values: Vec<ParameterValue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ParameterValue {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ParameterOccurrence {
+    source: String,
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct JsonParametersDebug {
+    detected: bool,
+    parse_error: Option<String>,
+    root: Option<Value>,
+    flattened: Vec<ParameterValue>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct MultipartParametersDebug {
+    detected: bool,
+    boundary: Option<String>,
+    parse_error: Option<String>,
+    parts: Vec<MultipartPartDebug>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MultipartPartDebug {
+    name: Option<String>,
+    file_name: Option<String>,
+    content_type: Option<String>,
+    size: usize,
+    sha256: String,
+    is_pdf: bool,
+    text: Option<String>,
+    text_truncated: bool,
+    base64: Option<String>,
+    base64_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +208,8 @@ struct PdfsigDebug {
     stderr: String,
     error: Option<String>,
     contains_signatures: bool,
+    actionable_signatures_count: usize,
+    ignored_signatures_count: usize,
     signatures: Vec<SignatureInfo>,
 }
 
@@ -190,8 +278,10 @@ async fn process_webhook(
     );
 
     let body = to_bytes(body, state.config.max_body_bytes).await?;
+    let body_debug = debug_body(&body);
     let parsed_payload = parse_payload(&headers, &uri, body.clone()).await;
     let context = document_context(&headers, &uri, &parsed_payload);
+    let parameters = parsed_payload.parameters.clone();
     let mut pdf = parsed_payload.pdf;
     let mut download_error = None;
 
@@ -275,40 +365,18 @@ async fn process_webhook(
     let paperless =
         update_paperless_if_signed(&state, &request_id, context.document_id, pdfsig.as_ref()).await;
 
-    let dump = DebugDump {
-        request_id: request_id.clone(),
-        received_at,
-        remote_addr: remote_addr.to_string(),
-        method,
-        uri,
-        headers: headers_to_map(&headers),
-        context,
-        body: DebugBody {
-            length: body.len(),
-            sha256: sha256_hex(&body),
-            text: String::from_utf8(body.to_vec()).ok(),
-            json: serde_json::from_slice::<Value>(&body).ok(),
-            base64: general_purpose::STANDARD.encode(&body),
-        },
-        pdf: pdf_debug,
-        pdfsig,
-        paperless,
-    };
-
-    write_debug_dump(&state.config.debug_dir, &request_id, &dump).await?;
-
-    let pdfsig_available = dump
-        .pdfsig
+    let pdfsig_available = pdfsig
         .as_ref()
         .map(|pdfsig| pdfsig.available)
         .unwrap_or(false);
-    let signatures_found = dump
-        .pdfsig
+    let signatures_found = pdfsig
         .as_ref()
         .map(|pdfsig| pdfsig.contains_signatures)
         .unwrap_or(false);
-    let paperless_updated = dump.paperless.result.is_some();
-    let message = if !dump.pdf.detected {
+    let pdf_detected = pdf_debug.detected;
+    let paperless_updated = paperless.result.is_some();
+    let document_id = context.document_id;
+    let message = if !pdf_detected {
         "payload saved; no PDF detected".to_owned()
     } else if signatures_found && paperless_updated {
         "payload saved; PDF signature found and Paperless updated".to_owned()
@@ -320,16 +388,44 @@ async fn process_webhook(
         "payload saved; PDF detected but pdfsig is unavailable or failed".to_owned()
     };
 
-    Ok(WebhookResponse {
+    let response = WebhookResponse {
         request_id,
         status: "ok",
-        pdf_detected: dump.pdf.detected,
+        pdf_detected,
         pdfsig_available,
         signatures_found,
-        document_id: dump.context.document_id,
+        document_id,
         paperless_updated,
         message,
-    })
+    };
+    let (path, query_string) = uri_parts(&uri);
+    let dump = DebugDump {
+        request_id: response.request_id.clone(),
+        received_at,
+        ask: AskDebug {
+            remote_addr: remote_addr.to_string(),
+            method,
+            uri,
+            path,
+            query_string,
+            content_type: content_type_value(&headers),
+            headers: headers_to_map(&headers),
+            body: body_debug,
+            parameters,
+        },
+        response: ResponseDebug {
+            status_code: StatusCode::OK.as_u16(),
+            body: response.clone(),
+        },
+        context,
+        pdf: pdf_debug,
+        pdfsig,
+        paperless,
+    };
+
+    write_debug_dump(&state.config.debug_dir, &response.request_id, &dump).await?;
+
+    Ok(response)
 }
 
 async fn write_debug_dump(
@@ -349,8 +445,47 @@ async fn write_debug_dump(
     Ok(())
 }
 
+fn debug_body(body: &Bytes) -> DebugBody {
+    DebugBody {
+        length: body.len(),
+        sha256: sha256_hex(body),
+        is_utf8: std::str::from_utf8(body).is_ok(),
+        text: String::from_utf8(body.to_vec()).ok(),
+        json: serde_json::from_slice::<Value>(body).ok(),
+        base64: general_purpose::STANDARD.encode(body),
+    }
+}
+
+fn uri_parts(uri: &str) -> (String, Option<String>) {
+    match uri.split_once('?') {
+        Some((path, query)) => (path.to_owned(), Some(query.to_owned())),
+        None => (uri.to_owned(), None),
+    }
+}
+
+fn content_type_value(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 async fn parse_payload(headers: &HeaderMap, uri: &str, body: Bytes) -> ParsedPayload {
-    let mut fields = query_fields(uri);
+    let mut fields = BTreeMap::new();
+    let mut parameters = RequestParametersDebug::default();
+
+    let query_values = query_parameters(uri);
+    add_parameter_values(&mut fields, &mut parameters, "query", &query_values);
+    parameters.query = parameter_group(query_values);
+
+    let header_values = header_context_parameters(headers);
+    add_parameter_values(
+        &mut fields,
+        &mut parameters,
+        "header_context",
+        &header_values,
+    );
+    parameters.header_context = parameter_group(header_values);
 
     if is_pdf(&body) {
         return ParsedPayload {
@@ -361,11 +496,8 @@ async fn parse_payload(headers: &HeaderMap, uri: &str, body: Bytes) -> ParsedPay
             }),
             fields,
             json: None,
+            parameters,
         };
-    }
-
-    for (key, value) in header_context_fields(headers) {
-        fields.insert(key, value);
     }
 
     let mut pdf = None;
@@ -374,42 +506,89 @@ async fn parse_payload(headers: &HeaderMap, uri: &str, body: Bytes) -> ParsedPay
     let content_type_lower = content_type.to_ascii_lowercase();
 
     if content_type_lower.starts_with("multipart/form-data") {
+        parameters.multipart.detected = true;
         if let Some(boundary) = multipart_boundary(&content_type) {
+            parameters.multipart.boundary = Some(boundary.clone());
             match parse_multipart_payload(body.clone(), &boundary).await {
-                Ok(mut payload) => {
-                    fields.append(&mut payload.fields);
+                Ok(payload) => {
+                    add_parameter_values(
+                        &mut fields,
+                        &mut parameters,
+                        "multipart",
+                        &payload.fields,
+                    );
+                    parameters.multipart.parts = payload.parts;
                     pdf = payload.pdf;
                 }
-                Err(err) => warn!(error = %err, "failed to parse multipart webhook payload"),
+                Err(err) => {
+                    let message = err.to_string();
+                    parameters.multipart.parse_error = Some(message.clone());
+                    warn!(error = %message, "failed to parse multipart webhook payload");
+                }
             }
+        } else {
+            parameters.multipart.parse_error =
+                Some("missing multipart boundary in Content-Type".to_owned());
         }
+    }
+
+    if content_type_lower.starts_with("application/x-www-form-urlencoded")
+        || should_parse_body_as_form_urlencoded(&content_type_lower, &body)
+    {
+        let form_values = form_urlencoded_parameters(&body);
+        add_parameter_values(
+            &mut fields,
+            &mut parameters,
+            "form_urlencoded",
+            &form_values,
+        );
+        parameters.form_urlencoded = parameter_group(form_values);
     }
 
     if pdf.is_none() && (content_type_lower.contains("json") || looks_like_json(&body)) {
+        parameters.json.detected = true;
         match serde_json::from_slice::<Value>(&body) {
             Ok(value) => {
-                collect_json_fields(&value, "$", &mut fields);
+                let json_values = json_parameters(&value);
+                add_parameter_values(&mut fields, &mut parameters, "json", &json_values);
+                parameters.json.root = Some(value.clone());
+                parameters.json.flattened = json_values;
                 pdf = find_pdf_in_json(&value, "$");
                 json = Some(value);
             }
-            Err(err) => warn!(error = %err, "failed to parse JSON webhook payload"),
+            Err(err) => {
+                let message = err.to_string();
+                parameters.json.parse_error = Some(message.clone());
+                warn!(error = %message, "failed to parse JSON webhook payload");
+            }
         }
     }
 
-    ParsedPayload { pdf, fields, json }
+    ParsedPayload {
+        pdf,
+        fields,
+        json,
+        parameters,
+    }
 }
 
-async fn parse_multipart_payload(body: Bytes, boundary: &str) -> anyhow::Result<ParsedPayload> {
+async fn parse_multipart_payload(
+    body: Bytes,
+    boundary: &str,
+) -> anyhow::Result<ParsedMultipartPayload> {
     let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
     let mut multipart = multer::Multipart::new(stream, boundary.to_owned());
     let mut pdf = None;
-    let mut fields = BTreeMap::new();
+    let mut fields = Vec::new();
+    let mut parts = Vec::new();
 
     while let Some(field) = multipart.next_field().await? {
         let name = field.name().map(str::to_owned);
         let file_name = field.file_name().map(str::to_owned);
         let content_type = field.content_type().map(ToString::to_string);
         let bytes = field.bytes().await?;
+        let size = bytes.len();
+        let sha256 = sha256_hex(&bytes);
 
         let file_name_is_pdf = file_name
             .as_deref()
@@ -420,6 +599,15 @@ async fn parse_multipart_payload(body: Bytes, boundary: &str) -> anyhow::Result<
             .map(|value| value.eq_ignore_ascii_case("application/pdf"))
             .unwrap_or(false);
         let is_pdf_field = is_pdf(&bytes) || file_name_is_pdf || content_type_is_pdf;
+        parts.push(multipart_part_debug(
+            name.clone(),
+            file_name.clone(),
+            content_type,
+            &bytes,
+            size,
+            sha256,
+            is_pdf_field,
+        ));
 
         if is_pdf_field && pdf.is_none() {
             pdf = Some(ExtractedPdf {
@@ -434,15 +622,14 @@ async fn parse_multipart_payload(body: Bytes, boundary: &str) -> anyhow::Result<
         }
 
         if let Some(name) = name {
-            fields.insert(name, field_value(bytes));
+            fields.push(ParameterValue {
+                name,
+                value: field_value(bytes),
+            });
         }
     }
 
-    Ok(ParsedPayload {
-        pdf,
-        fields,
-        json: None,
-    })
+    Ok(ParsedMultipartPayload { pdf, fields, parts })
 }
 
 fn document_context(
@@ -483,17 +670,28 @@ fn document_context(
 }
 
 fn query_fields(uri: &str) -> BTreeMap<String, String> {
+    parameters_to_map(query_parameters(uri))
+}
+
+fn query_parameters(uri: &str) -> Vec<ParameterValue> {
     let Some((_, query)) = uri.split_once('?') else {
-        return BTreeMap::new();
+        return Vec::new();
     };
 
     form_urlencoded::parse(query.as_bytes())
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .map(|(name, value)| ParameterValue {
+            name: name.into_owned(),
+            value: value.into_owned(),
+        })
         .collect()
 }
 
 fn header_context_fields(headers: &HeaderMap) -> BTreeMap<String, String> {
-    let mut fields = BTreeMap::new();
+    parameters_to_map(header_context_parameters(headers))
+}
+
+fn header_context_parameters(headers: &HeaderMap) -> Vec<ParameterValue> {
+    let mut values = Vec::new();
     for name in [
         "x-paperless-document-id",
         "x-document-id",
@@ -501,10 +699,80 @@ fn header_context_fields(headers: &HeaderMap) -> BTreeMap<String, String> {
         "x-document-url",
     ] {
         if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
-            fields.insert(name.to_owned(), value.to_owned());
+            values.push(ParameterValue {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            });
         }
     }
-    fields
+    values
+}
+
+fn form_urlencoded_parameters(body: &[u8]) -> Vec<ParameterValue> {
+    form_urlencoded::parse(body)
+        .map(|(name, value)| ParameterValue {
+            name: name.into_owned(),
+            value: value.into_owned(),
+        })
+        .collect()
+}
+
+fn should_parse_body_as_form_urlencoded(content_type_lower: &str, body: &[u8]) -> bool {
+    if !content_type_lower.trim().is_empty() {
+        return false;
+    }
+
+    let Ok(text) = std::str::from_utf8(body) else {
+        return false;
+    };
+    let text = text.trim();
+
+    !text.is_empty()
+        && text.contains('=')
+        && !looks_like_json(body)
+        && form_urlencoded_parameters(body)
+            .iter()
+            .any(|value| !value.name.trim().is_empty())
+}
+
+fn parameters_to_map(values: Vec<ParameterValue>) -> BTreeMap<String, String> {
+    values
+        .into_iter()
+        .map(|value| (value.name, value.value))
+        .collect()
+}
+
+fn parameter_group(values: Vec<ParameterValue>) -> ParameterGroup {
+    ParameterGroup {
+        count: values.len(),
+        values,
+    }
+}
+
+fn add_parameter_values(
+    fields: &mut BTreeMap<String, String>,
+    parameters: &mut RequestParametersDebug,
+    source: &str,
+    values: &[ParameterValue],
+) {
+    for value in values {
+        fields.insert(value.name.clone(), value.value.clone());
+        parameters
+            .combined
+            .entry(value.name.clone())
+            .or_default()
+            .push(ParameterOccurrence {
+                source: source.to_owned(),
+                name: value.name.clone(),
+                value: value.value.clone(),
+            });
+    }
+}
+
+fn json_parameters(value: &Value) -> Vec<ParameterValue> {
+    let mut values = Vec::new();
+    collect_json_parameters(value, "$", &mut values);
+    values
 }
 
 fn field_value(bytes: Bytes) -> String {
@@ -521,28 +789,83 @@ fn field_value(bytes: Bytes) -> String {
     })
 }
 
-fn collect_json_fields(value: &Value, path: &str, fields: &mut BTreeMap<String, String>) {
+fn collect_json_parameters(value: &Value, path: &str, values: &mut Vec<ParameterValue>) {
     match value {
         Value::String(text) => {
-            fields.insert(path.to_owned(), text.clone());
+            values.push(ParameterValue {
+                name: path.to_owned(),
+                value: text.clone(),
+            });
         }
         Value::Number(number) => {
-            fields.insert(path.to_owned(), number.to_string());
+            values.push(ParameterValue {
+                name: path.to_owned(),
+                value: number.to_string(),
+            });
         }
         Value::Bool(value) => {
-            fields.insert(path.to_owned(), value.to_string());
+            values.push(ParameterValue {
+                name: path.to_owned(),
+                value: value.to_string(),
+            });
         }
-        Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                collect_json_fields(value, &format!("{path}[{index}]"), fields);
+        Value::Array(array) => {
+            for (index, value) in array.iter().enumerate() {
+                collect_json_parameters(value, &format!("{path}[{index}]"), values);
             }
         }
-        Value::Object(values) => {
-            for (key, value) in values {
-                collect_json_fields(value, &format!("{path}.{key}"), fields);
+        Value::Object(object) => {
+            for (key, value) in object {
+                collect_json_parameters(value, &format!("{path}.{key}"), values);
             }
         }
         Value::Null => {}
+    }
+}
+
+fn multipart_part_debug(
+    name: Option<String>,
+    file_name: Option<String>,
+    content_type: Option<String>,
+    bytes: &Bytes,
+    size: usize,
+    sha256: String,
+    is_pdf: bool,
+) -> MultipartPartDebug {
+    let (text, text_truncated) = debug_text(bytes);
+    let (base64, base64_truncated) = debug_base64(bytes);
+
+    MultipartPartDebug {
+        name,
+        file_name,
+        content_type,
+        size,
+        sha256,
+        is_pdf,
+        text,
+        text_truncated,
+        base64,
+        base64_truncated,
+    }
+}
+
+fn debug_text(bytes: &[u8]) -> (Option<String>, bool) {
+    const DEBUG_TEXT_LIMIT: usize = 65_536;
+
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.chars().count() <= DEBUG_TEXT_LIMIT => (Some(text.to_owned()), false),
+        Ok(text) => (Some(text.chars().take(DEBUG_TEXT_LIMIT).collect()), true),
+        Err(_) => (None, false),
+    }
+}
+
+fn debug_base64(bytes: &[u8]) -> (Option<String>, bool) {
+    const DEBUG_FIELD_BASE64_LIMIT: usize = 1_048_576;
+
+    if bytes.len() > DEBUG_FIELD_BASE64_LIMIT {
+        (None, true)
+    } else {
+        (Some(general_purpose::STANDARD.encode(bytes)), false)
     }
 }
 
@@ -657,8 +980,8 @@ async fn update_paperless_if_signed(
     pdfsig: Option<&PdfsigDebug>,
 ) -> PaperlessDebug {
     let signatures = pdfsig
-        .map(|pdfsig| pdfsig.signatures.as_slice())
-        .unwrap_or(&[]);
+        .map(|pdfsig| actionable_signatures(&pdfsig.signatures))
+        .unwrap_or_default();
 
     if signatures.is_empty() {
         return PaperlessDebug {
@@ -699,7 +1022,7 @@ async fn update_paperless_if_signed(
     };
 
     match paperless
-        .update_signed_document(document_id, signatures)
+        .update_signed_document(document_id, &signatures)
         .await
     {
         Ok(result) => {
@@ -814,6 +1137,8 @@ async fn run_pdfsig(config: &Config, request_id: &str, pdf_path: &Path) -> Pdfsi
                 stderr: String::new(),
                 error: Some("pdfsig command not found".to_owned()),
                 contains_signatures: false,
+                actionable_signatures_count: 0,
+                ignored_signatures_count: 0,
                 signatures: Vec::new(),
             };
         }
@@ -830,6 +1155,11 @@ async fn run_pdfsig(config: &Config, request_id: &str, pdf_path: &Path) -> Pdfsi
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let signatures = parse_pdfsig_output(&stdout);
+            let actionable_signatures_count = actionable_signatures(&signatures).len();
+            let ignored_signatures_count = signatures
+                .iter()
+                .filter(|signature| signature.ignored)
+                .count();
             PdfsigDebug {
                 available: true,
                 command: Some(command_path.display().to_string()),
@@ -837,7 +1167,9 @@ async fn run_pdfsig(config: &Config, request_id: &str, pdf_path: &Path) -> Pdfsi
                 stdout,
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 error: None,
-                contains_signatures: !signatures.is_empty(),
+                contains_signatures: actionable_signatures_count > 0,
+                actionable_signatures_count,
+                ignored_signatures_count,
                 signatures,
             }
         }
@@ -857,6 +1189,8 @@ async fn run_pdfsig(config: &Config, request_id: &str, pdf_path: &Path) -> Pdfsi
                 stderr: String::new(),
                 error: Some(message),
                 contains_signatures: false,
+                actionable_signatures_count: 0,
+                ignored_signatures_count: 0,
                 signatures: Vec::new(),
             }
         }
@@ -988,5 +1322,20 @@ mod tests {
         assert!(is_document_id_key("DOCUMENT_ID"));
         assert!(is_document_id_key("$.document_id"));
         assert!(is_document_id_key("x-paperless-document-id"));
+    }
+
+    #[test]
+    fn detects_form_urlencoded_body_without_content_type() {
+        let body = b"document_id=6&doc_url=https://paperless.infolab.com.pl/documents/6/";
+        assert!(should_parse_body_as_form_urlencoded("", body));
+
+        let values = form_urlencoded_parameters(body);
+        assert_eq!(values[0].name, "document_id");
+        assert_eq!(values[0].value, "6");
+        assert_eq!(values[1].name, "doc_url");
+        assert_eq!(
+            values[1].value,
+            "https://paperless.infolab.com.pl/documents/6/"
+        );
     }
 }
