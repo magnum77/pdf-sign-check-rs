@@ -192,6 +192,8 @@ PDF_SIGN_CHECK_BIND=0.0.0.0:3000
 PDF_SIGN_CHECK_WEBHOOK_PATH=/webhook
 PDF_SIGN_CHECK_DEBUG_DIR=debug
 PDF_SIGN_CHECK_LOG_DIR=logs
+PDF_SIGN_CHECK_DEBUG_RETENTION_COUNT=5
+PDF_SIGN_CHECK_LOG_RETENTION_COUNT=5
 PDF_SIGN_CHECK_TEMP_DIR=/tmp/pdf-sign-check-rs
 PDF_SIGN_CHECK_MAX_BODY_BYTES=26214400
 
@@ -207,6 +209,12 @@ Use either:
 
 - `PAPERLESS_TOKEN`, or
 - `PAPERLESS_USERNAME` and `PAPERLESS_PASSWORD`
+
+`PDF_SIGN_CHECK_DEBUG_RETENTION_COUNT` controls `debug/` dumps, and
+`PDF_SIGN_CHECK_LOG_RETENTION_COUNT` controls `logs/`:
+
+- `0` disables writing that directory to disk; stdout logging still remains.
+- `N > 0` keeps only the newest `N` files in that directory.
 
 Do not commit `.env`.
 
@@ -311,8 +319,8 @@ cargo test
 
 Useful directories:
 
-- `debug/`: request and processing dumps
-- `logs/`: daily service logs
+- `debug/`: request and processing dumps, retained by `PDF_SIGN_CHECK_DEBUG_RETENTION_COUNT`
+- `logs/`: daily service logs, retained by `PDF_SIGN_CHECK_LOG_RETENTION_COUNT`
 - `/tmp/pdf-sign-check-rs`: temporary PDF files
 
 ## Security Notes

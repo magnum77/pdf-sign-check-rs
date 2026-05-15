@@ -10,6 +10,8 @@ pub struct Config {
     pub webhook_path: String,
     pub debug_dir: PathBuf,
     pub log_dir: PathBuf,
+    pub debug_retention_count: usize,
+    pub log_retention_count: usize,
     pub temp_dir: PathBuf,
     pub max_body_bytes: usize,
     pub pdfsig_path: Option<PathBuf>,
@@ -34,6 +36,9 @@ impl Config {
         let webhook_path = normalize_path(&env_value("PDF_SIGN_CHECK_WEBHOOK_PATH", "/webhook"));
         let debug_dir = PathBuf::from(env_value("PDF_SIGN_CHECK_DEBUG_DIR", "debug"));
         let log_dir = PathBuf::from(env_value("PDF_SIGN_CHECK_LOG_DIR", "logs"));
+        let debug_retention_count =
+            env_value("PDF_SIGN_CHECK_DEBUG_RETENTION_COUNT", "5").parse()?;
+        let log_retention_count = env_value("PDF_SIGN_CHECK_LOG_RETENTION_COUNT", "5").parse()?;
         let temp_dir = env::var_os("PDF_SIGN_CHECK_TEMP_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| env::temp_dir().join("pdf-sign-check-rs"));
@@ -46,6 +51,8 @@ impl Config {
             webhook_path,
             debug_dir,
             log_dir,
+            debug_retention_count,
+            log_retention_count,
             temp_dir,
             max_body_bytes,
             pdfsig_path,
@@ -54,8 +61,12 @@ impl Config {
     }
 
     pub fn ensure_dirs_blocking(&self) -> std::io::Result<()> {
-        ensure_dir(&self.debug_dir)?;
-        ensure_dir(&self.log_dir)?;
+        if self.debug_retention_count > 0 {
+            ensure_dir(&self.debug_dir)?;
+        }
+        if self.log_retention_count > 0 {
+            ensure_dir(&self.log_dir)?;
+        }
         ensure_dir(&self.temp_dir)?;
         Ok(())
     }

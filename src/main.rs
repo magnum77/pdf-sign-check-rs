@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Router, routing::get, routing::post};
 use tokio::{net::TcpListener, signal};
@@ -7,11 +8,13 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 mod config;
 mod paperless;
+mod retention;
 mod signature;
 mod webhook;
 
 use config::Config;
 use paperless::PaperlessClient;
+use retention::cleanup_retained_files;
 use webhook::AppState;
 
 #[tokio::main]
@@ -20,6 +23,8 @@ async fn main() -> anyhow::Result<()> {
     config.ensure_dirs_blocking()?;
 
     let _log_guard = init_logging(&config);
+    cleanup_log_retention(&config).await?;
+    let _log_retention_task = spawn_log_retention_task(config.clone());
 
     let paperless = config.paperless.clone().map(PaperlessClient::new);
     let state = Arc::new(AppState {
@@ -37,6 +42,8 @@ async fn main() -> anyhow::Result<()> {
         webhook_path = %config.webhook_path,
         debug_dir = %config.debug_dir.display(),
         log_dir = %config.log_dir.display(),
+        debug_retention_count = config.debug_retention_count,
+        log_retention_count = config.log_retention_count,
         temp_dir = %config.temp_dir.display(),
         "pdf-sign-check-rs started"
     );
@@ -52,19 +59,68 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_logging(config: &Config) -> tracing_appender::non_blocking::WorkerGuard {
-    let file_appender = tracing_appender::rolling::daily(&config.log_dir, "pdf-sign-check.log");
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+fn init_logging(config: &Config) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("pdf_sign_check_rs=info,tower_http=info"));
 
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(file_writer).with_ansi(false))
-        .with(fmt::layer().with_writer(std::io::stdout))
-        .init();
+        .with(fmt::layer().with_writer(std::io::stdout));
 
-    guard
+    if config.log_retention_count == 0 {
+        subscriber.init();
+        None
+    } else {
+        let file_appender = tracing_appender::rolling::daily(&config.log_dir, "pdf-sign-check.log");
+        let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+        subscriber
+            .with(fmt::layer().with_writer(file_writer).with_ansi(false))
+            .init();
+        Some(guard)
+    }
+}
+
+async fn cleanup_log_retention(config: &Config) -> anyhow::Result<()> {
+    if config.log_retention_count == 0 {
+        return Ok(());
+    }
+
+    let removed = cleanup_retained_files(&config.log_dir, config.log_retention_count, |path| {
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.starts_with("pdf-sign-check.log"))
+            .unwrap_or(false)
+    })
+    .await?;
+
+    if removed > 0 {
+        info!(
+            retention_count = config.log_retention_count,
+            removed,
+            log_dir = %config.log_dir.display(),
+            "old log files removed"
+        );
+    }
+
+    Ok(())
+}
+
+fn spawn_log_retention_task(config: Config) -> Option<tokio::task::JoinHandle<()>> {
+    if config.log_retention_count == 0 {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            if let Err(err) = cleanup_log_retention(&config).await {
+                warn!(error = %err, "failed to clean up retained log files");
+            }
+        }
+    }))
 }
 
 async fn shutdown_signal() {

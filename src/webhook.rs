@@ -30,6 +30,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     paperless::{PaperlessClient, PaperlessUpdateResult},
+    retention::cleanup_retained_files,
     signature::{SignatureInfo, actionable_signatures, parse_pdfsig_output},
 };
 
@@ -423,7 +424,13 @@ async fn process_webhook(
         paperless,
     };
 
-    write_debug_dump(&state.config.debug_dir, &response.request_id, &dump).await?;
+    write_debug_dump(
+        &state.config.debug_dir,
+        &response.request_id,
+        &dump,
+        state.config.debug_retention_count,
+    )
+    .await?;
 
     Ok(response)
 }
@@ -432,7 +439,12 @@ async fn write_debug_dump(
     debug_dir: &Path,
     request_id: &str,
     dump: &DebugDump,
+    retention_count: usize,
 ) -> anyhow::Result<()> {
+    if retention_count == 0 {
+        return Ok(());
+    }
+
     fs::create_dir_all(debug_dir).await?;
     let path = debug_dir.join(format!("{request_id}.json"));
     let json = serde_json::to_vec_pretty(dump)?;
@@ -442,6 +454,21 @@ async fn write_debug_dump(
         debug_path = %path.display(),
         "debug dump saved"
     );
+    let removed = cleanup_retained_files(debug_dir, retention_count, |path| {
+        path.extension().and_then(|value| value.to_str()) == Some("json")
+    })
+    .await?;
+
+    if removed > 0 {
+        info!(
+            request_id,
+            debug_dir = %debug_dir.display(),
+            retention_count,
+            removed,
+            "old debug dumps removed"
+        );
+    }
+
     Ok(())
 }
 
