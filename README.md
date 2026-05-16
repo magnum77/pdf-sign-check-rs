@@ -22,6 +22,8 @@ also accept direct webhook calls from other systems.
 ## Features
 
 - HTTP webhook endpoint, default: `POST /webhook`
+- Welcome page at `GET /`
+- Interactive scan dashboard, default: `GET /scan`
 - Health endpoint: `GET /healthz`
 - Configurable bind address, default: `0.0.0.0:3000`
 - Daily logs under `logs/`
@@ -53,6 +55,20 @@ also accept direct webhook calls from other systems.
    - applies the tag to the document,
    - adds a note with parsed signature details.
 9. The temporary PDF file is removed.
+
+## Scan Dashboard
+
+Open `http://host:port/` for a welcome page with a direct link to the scan
+dashboard, or go straight to `http://host:port/scan` to inspect and run
+Paperless scans from the browser. The dashboard:
+
+- counts signed and unsigned PDF documents from Paperless,
+- offers `Scan not signed` and `Scan all` actions,
+- keeps a shared live progress view across all open tabs and windows through server-sent events,
+- disables concurrent scans while one is already running,
+- lets you request cancellation of the active scan,
+- remembers the last selected scan mode in the browser,
+- reports how many new documents were marked as signed when a scan completes.
 
 ## Supported Webhook Input Formats
 

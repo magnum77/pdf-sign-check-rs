@@ -9,12 +9,15 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 mod config;
 mod paperless;
 mod retention;
+mod scan;
 mod signature;
 mod webhook;
+mod welcome;
 
 use config::Config;
 use paperless::PaperlessClient;
 use retention::cleanup_retained_files;
+use scan::ScanCoordinator;
 use webhook::AppState;
 
 #[tokio::main]
@@ -30,8 +33,15 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         config: config.clone(),
         paperless,
+        scan: Arc::new(ScanCoordinator::new()),
     });
     let app = Router::new()
+        .route("/", get(welcome::page))
+        .route("/scan", get(scan::page))
+        .route("/scan/state", get(scan::state))
+        .route("/scan/events", get(scan::events))
+        .route("/scan/start", post(scan::start))
+        .route("/scan/cancel", post(scan::cancel))
         .route(&config.webhook_path, post(webhook::handle_webhook))
         .route("/healthz", get(webhook::health))
         .with_state(state);

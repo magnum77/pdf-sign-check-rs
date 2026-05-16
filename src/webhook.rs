@@ -31,6 +31,7 @@ use crate::{
     config::Config,
     paperless::{PaperlessClient, PaperlessUpdateResult},
     retention::cleanup_retained_files,
+    scan::ScanCoordinator,
     signature::{SignatureInfo, actionable_signatures, parse_pdfsig_output},
 };
 
@@ -38,6 +39,7 @@ use crate::{
 pub struct AppState {
     pub config: Config,
     pub paperless: Option<PaperlessClient>,
+    pub scan: Arc<ScanCoordinator>,
 }
 
 #[derive(Debug, Serialize)]

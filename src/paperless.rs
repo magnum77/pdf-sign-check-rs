@@ -25,6 +25,12 @@ pub struct PaperlessUpdateResult {
     pub note_added: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TagSummary {
+    pub id: i64,
+    pub name: String,
+}
+
 #[derive(Debug)]
 struct Auth {
     header_value: String,
@@ -38,12 +44,7 @@ struct TokenResponse {
 #[derive(Debug, Deserialize)]
 struct Paginated<T> {
     results: Vec<T>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Tag {
-    id: i64,
-    name: String,
+    next: Option<String>,
 }
 
 impl PaperlessClient {
@@ -95,6 +96,62 @@ impl PaperlessClient {
             .map_err(Into::into)
     }
 
+    pub async fn list_documents_raw(&self) -> anyhow::Result<Vec<Value>> {
+        let auth = self.auth().await?;
+        let mut next = Some(self.url("/api/documents/?page_size=100&ordering=id"));
+        let mut documents = Vec::new();
+
+        while let Some(url) = next {
+            let response = self
+                .client
+                .get(url)
+                .header(AUTHORIZATION, &auth.header_value)
+                .header(ACCEPT, self.accept_header())
+                .send()
+                .await
+                .context("failed to list Paperless documents")?;
+
+            let page = ensure_success(response)
+                .await?
+                .json::<Paginated<Value>>()
+                .await
+                .context("failed to parse Paperless documents response")?;
+
+            documents.extend(page.results);
+            next = page.next;
+        }
+
+        Ok(documents)
+    }
+
+    pub async fn list_tags(&self) -> anyhow::Result<Vec<TagSummary>> {
+        let auth = self.auth().await?;
+        let mut next = Some(self.url("/api/tags/?page_size=100"));
+        let mut tags = Vec::new();
+
+        while let Some(url) = next {
+            let response = self
+                .client
+                .get(url)
+                .header(AUTHORIZATION, &auth.header_value)
+                .header(ACCEPT, self.accept_header())
+                .send()
+                .await
+                .context("failed to list Paperless tags")?;
+
+            let page = ensure_success(response)
+                .await?
+                .json::<Paginated<TagSummary>>()
+                .await
+                .context("failed to parse Paperless tags response")?;
+
+            tags.extend(page.results);
+            next = page.next;
+        }
+
+        Ok(tags)
+    }
+
     async fn auth(&self) -> anyhow::Result<Auth> {
         if let Some(token) = &self.config.token {
             return Ok(Auth {
@@ -113,9 +170,10 @@ impl PaperlessClient {
             .as_deref()
             .ok_or_else(|| anyhow!("PAPERLESS_PASSWORD or PAPERLESS_TOKEN is required"))?;
 
+        let token_url = self.url("/api/token/");
         let response = self
             .client
-            .post(self.url("/api/token/"))
+            .post(&token_url)
             .header(ACCEPT, "application/json")
             .json(&json!({
                 "username": username,
@@ -123,7 +181,7 @@ impl PaperlessClient {
             }))
             .send()
             .await
-            .context("failed to request Paperless token")?;
+            .with_context(|| format!("failed to request Paperless token from {token_url}"))?;
 
         let token = ensure_success(response)
             .await?
@@ -162,36 +220,45 @@ impl PaperlessClient {
 
         let tag = ensure_success(response)
             .await?
-            .json::<Tag>()
+            .json::<TagSummary>()
             .await
             .context("failed to parse created Paperless tag")?;
         Ok((tag.id, true))
     }
 
-    async fn find_tag(&self, auth: &Auth) -> anyhow::Result<Option<Tag>> {
-        let response = self
-            .client
-            .get(self.url("/api/tags/"))
-            .header(AUTHORIZATION, &auth.header_value)
-            .header(ACCEPT, self.accept_header())
-            .query(&[
-                ("name__iexact", self.config.tag_name.as_str()),
-                ("page_size", "100"),
-            ])
-            .send()
-            .await
-            .context("failed to list Paperless tags")?;
-
-        let tags = ensure_success(response)
-            .await?
-            .json::<Paginated<Tag>>()
-            .await
-            .context("failed to parse Paperless tags response")?;
+    async fn find_tag(&self, auth: &Auth) -> anyhow::Result<Option<TagSummary>> {
+        let tags = self.list_tags_with_auth(auth).await?;
 
         Ok(tags
-            .results
             .into_iter()
             .find(|tag| tag.name.eq_ignore_ascii_case(&self.config.tag_name)))
+    }
+
+    async fn list_tags_with_auth(&self, auth: &Auth) -> anyhow::Result<Vec<TagSummary>> {
+        let mut next = Some(self.url("/api/tags/?page_size=100"));
+        let mut tags = Vec::new();
+
+        while let Some(url) = next {
+            let response = self
+                .client
+                .get(url)
+                .header(AUTHORIZATION, &auth.header_value)
+                .header(ACCEPT, self.accept_header())
+                .send()
+                .await
+                .context("failed to list Paperless tags")?;
+
+            let page = ensure_success(response)
+                .await?
+                .json::<Paginated<TagSummary>>()
+                .await
+                .context("failed to parse Paperless tags response")?;
+
+            tags.extend(page.results);
+            next = page.next;
+        }
+
+        Ok(tags)
     }
 
     async fn add_tag(&self, auth: &Auth, document_id: i64, tag_id: i64) -> anyhow::Result<()> {
