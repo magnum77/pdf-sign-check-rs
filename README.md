@@ -254,6 +254,60 @@ PDF_SIGN_CHECK_PORT=38080 docker compose up -d --build
 The service listens on container port `3000` and uses `restart: unless-stopped`
 for autostart. Health checks hit `GET /healthz`.
 
+## Apple Native Containers on macOS
+
+On Apple silicon Macs running macOS 26 or newer, the project also works with
+Apple's native [`container`](https://opensource.apple.com/projects/container/)
+runtime. The existing `Dockerfile` builds directly with `container build`, and
+the repository includes [`scripts/apple-container.sh`](scripts/apple-container.sh)
+as a small helper for the native workflow.
+
+Start the Apple container system once after installing the CLI:
+
+```bash
+container system start
+```
+
+Build the image:
+
+```bash
+scripts/apple-container.sh build
+```
+
+Run the service on `127.0.0.1:3000`:
+
+```bash
+scripts/apple-container.sh run
+```
+
+Check that it is healthy:
+
+```bash
+scripts/apple-container.sh health
+```
+
+Useful native-container commands:
+
+```bash
+scripts/apple-container.sh status
+scripts/apple-container.sh logs
+scripts/apple-container.sh stop
+scripts/apple-container.sh restart
+```
+
+Override the published host port when needed:
+
+```bash
+HOST_PORT=38080 scripts/apple-container.sh run
+```
+
+If `.env` exists, the helper passes it to the container with `--env-file`.
+Container data is persisted to host-mounted project directories:
+
+- `debug/` -> `/app/debug`
+- `logs/` -> `/app/logs`
+- `tmp/` -> `/tmp/pdf-sign-check-rs`
+
 ## Running
 
 Development:
