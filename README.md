@@ -234,6 +234,26 @@ Use either:
 
 Do not commit `.env`.
 
+## Docker Compose
+
+The repository includes a minimal Compose setup for Docker Desktop on macOS and
+regular Linux Docker installs.
+
+Start on the default host port:
+
+```bash
+docker compose up -d --build
+```
+
+Pick a different host port:
+
+```bash
+PDF_SIGN_CHECK_PORT=38080 docker compose up -d --build
+```
+
+The service listens on container port `3000` and uses `restart: unless-stopped`
+for autostart. Health checks hit `GET /healthz`.
+
 ## Running
 
 Development:
